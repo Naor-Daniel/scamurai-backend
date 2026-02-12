@@ -178,7 +178,7 @@ def init_gemini_if_possible() -> Optional[str]:
 
 
 def _gemini_call(subject: str, sender: str, body: str, domains: list[str]) -> dict[str, Any]:
-    model = genai.GenerativeModel(GEMINI_MODEL)
+    model = genai.GenerativeModel("gemini-1.5-flash-8b")
 
     schema = {
         "ai_risk": 0,
