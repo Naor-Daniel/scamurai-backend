@@ -17,23 +17,29 @@ def root():
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
-    score = 10
-    verdict = "Safe"
-
     text = (req.subject + " " + req.body).lower()
 
-    if "urgent" in text:
-        score = 60
-        verdict = "Suspicious"
+    # Risk score: 0 = safe, 100 = malicious
+    risk_score = 0
+    verdict = "Safe"
+    reasons = []
 
-    return {
-        "score": score,
-        "verdict": verdict,
-        "reasons": [
+    if "urgent" in text:
+        risk_score = 60
+        verdict = "Suspicious"
+        reasons.append(
             {
                 "title": "Urgent language detected",
                 "points": 50,
                 "evidence": "Found keyword 'urgent'"
             }
-        ] if verdict != "Safe" else []
+        )
+
+    # Safe score: 100 = safe, 0 = malicious
+    safe_score = max(0, min(100, 100 - risk_score))
+
+    return {
+        "score": safe_score,
+        "verdict": verdict,
+        "reasons": reasons
     }
