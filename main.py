@@ -21,7 +21,7 @@ VERSION = "2.1.0"
 RULES_WEIGHT = 0.3
 AI_WEIGHT = 0.7
 
-AI_TIMEOUT_SECONDS = 2.0
+AI_TIMEOUT_SECONDS = 15.0
 GEMINI_MODEL_CANDIDATES = [
     "models/gemini-2.5-flash",
     "models/gemini-2.5-flash-lite",
