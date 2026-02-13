@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 from uuid import uuid4
 
-import app
+
 from fastapi import FastAPI
 from google import genai
 from google.genai import types
@@ -35,6 +35,13 @@ modelCandidates = [
 ]
 
 selectedModel: str | None = None
+
+
+# =====================================================================
+# FastAPI application
+# =====================================================================
+
+app = FastAPI(title="ScamurAI Backend", version=applicationVersion)
 
 # =====================================================================
 # API models
