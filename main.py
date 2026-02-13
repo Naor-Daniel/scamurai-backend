@@ -8,7 +8,7 @@ from uuid import uuid4
 from typing import Any, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-import google.generativeai as genai
+from google import genai
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -26,7 +26,7 @@ GEMINI_MODEL = "gemini-1.5-flash"
 
 # ===================== App =====================
 
-app = FastAPI(title="Scamurai Backend", version=VERSION)
+app = FastAPI(title="ScamurAI Backend", version=VERSION)
 
 
 # ===================== Models =====================
@@ -165,20 +165,14 @@ def rules_engine(subject: str, sender: str, body: str) -> Tuple[int, dict, list[
 
 _GEMINI_READY = False
 
-def init_gemini_if_possible() -> Optional[str]:
-    global _GEMINI_READY
-    if _GEMINI_READY:
-        return None
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        return "Missing GEMINI_API_KEY"
-    genai.configure(api_key=api_key)
-    _GEMINI_READY = True
-    return None
 
 
 def _gemini_call(subject: str, sender: str, body: str, domains: list[str]) -> dict[str, Any]:
-    model = genai.GenerativeModel("gemini-1.5-flash-8b")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY")
+
+    client = genai.Client(api_key=api_key)
 
     schema = {
         "ai_risk": 0,
@@ -194,8 +188,9 @@ You are an email security analyst. Return ONLY valid JSON matching this schema e
 
 Rules:
 - ai_risk is 0..100 (0 safe, 100 dangerous).
-- Do not invent facts. Base findings on evidence from the email text and links/domains given.
-- summary <= 2 sentences. findings <= 5 items.
+- Do not invent facts.
+- summary <= 2 sentences.
+- findings <= 5 items.
 
 Email:
 Subject: {subject}
@@ -207,8 +202,12 @@ Body:
 {body[:8000]}
 """.strip()
 
-    resp = model.generate_content(prompt)
-    text = (resp.text or "").strip()
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+    )
+
+    text = (response.text or "").strip()
 
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
@@ -239,17 +238,6 @@ Body:
 
 
 def gemini_analyze(subject: str, sender: str, body: str, domains: list[str]) -> tuple[bool, dict[str, Any]]:
-    err = init_gemini_if_possible()
-    if err:
-        return False, {
-            "summary": "",
-            "threatType": "other",
-            "findings": [],
-            "model": GEMINI_MODEL,
-            "latencyMs": 0,
-            "error": err
-        }
-
     t0 = time.time()
     try:
         with ThreadPoolExecutor(max_workers=1) as ex:
