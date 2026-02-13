@@ -8,6 +8,7 @@ from uuid import uuid4
 from typing import Any, Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
+from google.genai import types
 from google import genai
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -22,9 +23,10 @@ AI_WEIGHT = 0.7
 
 AI_TIMEOUT_SECONDS = 2.0
 GEMINI_MODEL_CANDIDATES = [
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-001",
+    "models/gemini-2.5-flash",
+    "models/gemini-2.5-flash-lite",
+    "models/gemini-2.0-flash",
+    "models/gemini-2.0-flash-lite",
 ]
 _SELECTED_MODEL: str | None = None
 
@@ -193,7 +195,10 @@ def _gemini_call(subject: str, sender: str, body: str, domains: list[str]) -> di
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY")
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1"),
+    )
 
     schema = {
         "ai_risk": 0,
