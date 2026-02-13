@@ -21,7 +21,12 @@ RULES_WEIGHT = 0.3
 AI_WEIGHT = 0.7
 
 AI_TIMEOUT_SECONDS = 2.0
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-001",
+]
+_SELECTED_MODEL: str | None = None
 
 
 # ===================== App =====================
@@ -166,6 +171,22 @@ def rules_engine(subject: str, sender: str, body: str) -> Tuple[int, dict, list[
 _GEMINI_READY = False
 
 
+def pick_working_model(client: genai.Client) -> str:
+    global _SELECTED_MODEL
+    if _SELECTED_MODEL:
+        return _SELECTED_MODEL
+
+    last_err = ""
+    for m in GEMINI_MODEL_CANDIDATES:
+        try:
+            client.models.generate_content(model=m, contents="ping")
+            _SELECTED_MODEL = m
+            return m
+        except Exception as e:
+            last_err = str(e)
+
+    raise RuntimeError(f"No working Gemini model found. Last error: {last_err}")
+
 
 def _gemini_call(subject: str, sender: str, body: str, domains: list[str]) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -202,13 +223,10 @@ Body:
 {body[:8000]}
 """.strip()
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
+    model_name = pick_working_model(client)
+    response = client.models.generate_content(model=model_name, contents=prompt)
 
     text = (response.text or "").strip()
-
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
         raise RuntimeError("Gemini did not return JSON")
@@ -233,7 +251,8 @@ Body:
         "confidence": confidence,
         "threatType": threat_type,
         "summary": summary,
-        "findings": findings
+        "findings": findings,
+        "model": model_name
     }
 
 
@@ -247,14 +266,14 @@ def gemini_analyze(subject: str, sender: str, body: str, domains: list[str]) -> 
         latency_ms = int((time.time() - t0) * 1000)
 
         return True, {
-            "summary": data["summary"],
-            "threatType": data["threatType"],
-            "findings": data["findings"],
-            "model": GEMINI_MODEL,
+            "summary": data.get("summary", ""),
+            "threatType": data.get("threatType", "other"),
+            "findings": data.get("findings", []),
+            "model": data.get("model", ""),
             "latencyMs": latency_ms,
             "error": "",
-            "_risk_ai": int(data["risk_ai"]),
-            "_confidence": str(data["confidence"])
+            "_risk_ai": int(data.get("risk_ai", 0)),
+            "_confidence": str(data.get("confidence", "Low"))
         }
 
     except FuturesTimeoutError:
@@ -263,7 +282,7 @@ def gemini_analyze(subject: str, sender: str, body: str, domains: list[str]) -> 
             "summary": "",
             "threatType": "other",
             "findings": [],
-            "model": GEMINI_MODEL,
+            "model": "",
             "latencyMs": latency_ms,
             "error": f"AI timeout after {AI_TIMEOUT_SECONDS}s"
         }
@@ -273,7 +292,7 @@ def gemini_analyze(subject: str, sender: str, body: str, domains: list[str]) -> 
             "summary": "",
             "threatType": "other",
             "findings": [],
-            "model": GEMINI_MODEL,
+            "model": "",
             "latencyMs": latency_ms,
             "error": str(ex)
         }
