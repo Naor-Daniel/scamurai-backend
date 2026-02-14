@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 from uuid import uuid4
 
-
 from fastapi import FastAPI
 from google import genai
 from google.genai import types
@@ -19,11 +18,9 @@ from pydantic import BaseModel, Field
 # Application configuration
 # =====================================================================
 
-applicationVersion = "2.2.0"
+applicationVersion = "3.0.0"
 
-rulesWeight = 0.30
-aiWeight = 0.70
-
+hardChecksWeight = float(os.getenv("HARD_CHECKS_WEIGHT", "0.30"))
 aiTimeoutSeconds = float(os.getenv("AI_TIMEOUT_SECONDS", "12.0"))
 geminiApiKeyEnvironmentVariable = "GEMINI_API_KEY"
 
@@ -36,7 +33,6 @@ modelCandidates = [
 
 selectedModel: str | None = None
 
-
 # =====================================================================
 # FastAPI application
 # =====================================================================
@@ -47,19 +43,23 @@ app = FastAPI(title="ScamurAI Backend", version=applicationVersion)
 # API models
 # =====================================================================
 
+class AuthenticationSummary(BaseModel):
+    spf: str = "unknown"
+    dkim: str = "unknown"
+    dmarc: str = "unknown"
+
+
 class AnalyzeRequest(BaseModel):
-    """Request payload sent by the Gmail add-on."""
     subject: str = ""
     sender: str = ""
     body: str = ""
+    fromDomain: str = ""
+    replyToDomain: str = ""
+    returnPathDomain: str = ""
+    authentication: AuthenticationSummary = Field(default_factory=AuthenticationSummary)
 
 
 class RiskReason(BaseModel):
-    """
-    A single deterministic signal from the rules engine.
-
-    points is a contribution to risk (0..100). It is not a probability.
-    """
     id: str
     title: str
     points: int = Field(ge=0, le=100)
@@ -67,7 +67,6 @@ class RiskReason(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """Response payload returned to the Gmail add-on."""
     score: int = Field(ge=0, le=100)
     verdict: str
     confidence: str
@@ -79,53 +78,38 @@ class AnalyzeResponse(BaseModel):
     version: str
     traceId: str
 
-
 # =====================================================================
 # Domain types
 # =====================================================================
 
 @dataclass(frozen=True)
 class EmailFeatures:
-    """Derived features extracted from the email for rules + AI prompt conditioning."""
     urls: List[str]
     domains: List[str]
     containsHttpLinks: bool
     containsShortenedLinks: bool
     containsMixedScriptText: bool
 
-
 # =====================================================================
 # Utility helpers
 # =====================================================================
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
-    """Clamp numeric value to [minimum, maximum]."""
     return max(minimum, min(maximum, value))
 
 
-def normalizeText(subject: str, body: str) -> str:
-    """Normalize email content for deterministic keyword checks."""
-    return (subject + "\n" + body).lower().strip()
-
-
 def extractUrls(text: str) -> List[str]:
-    """Extract up to 50 URLs from the email body."""
     if not text:
         return []
     return re.findall(r"\bhttps?://[^\s<>\"]+", text, flags=re.IGNORECASE)[:50]
 
 
-def extractDomain(url: str) -> str:
-    """Extract host portion from a URL."""
+def extractDomainFromUrl(url: str) -> str:
     match = re.match(r"^https?://([^/]+)", url.strip(), flags=re.IGNORECASE)
     return match.group(1).lower() if match else ""
 
 
 def containsMixedScript(text: str) -> bool:
-    """
-    Heuristic for common spoofing: detect a mix of Latin and non-ASCII characters.
-    Conservative by design to avoid false positives.
-    """
     if not text:
         return False
     hasLatin = bool(re.search(r"[A-Za-z]", text))
@@ -134,10 +118,8 @@ def containsMixedScript(text: str) -> bool:
 
 
 def computeFeatures(subject: str, sender: str, body: str) -> EmailFeatures:
-    """Compute structured signals used by rules and prompt conditioning."""
     urls = extractUrls(body)
-    domains = sorted(set([extractDomain(url) for url in urls if url]))[:20]
-
+    domains = sorted(set([extractDomainFromUrl(url) for url in urls if url]))[:20]
     containsHttpLinks = any(url.lower().startswith("http://") for url in urls)
 
     knownShorteners = ["bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly"]
@@ -155,209 +137,17 @@ def computeFeatures(subject: str, sender: str, body: str) -> EmailFeatures:
 
 
 def verdictFromRisk(risk: int) -> str:
-    """Map risk score to a coarse verdict."""
     if risk >= 75:
         return "Malicious"
     if risk >= 35:
         return "Suspicious"
     return "Safe"
 
-
-def confidenceFromClassification(
-    finalRisk: int,
-    rulesRisk: int,
-    aiRisk: int,
-    aiAvailable: bool,
-    guardrailApplied: bool
-) -> str:
-    """
-    Confidence is about classification stability (Safe/Suspicious/Malicious),
-    not about the raw risk magnitude.
-
-    Signals:
-    - distance from decision boundaries (35, 75)
-    - agreement between rules and AI (if AI available)
-    - guardrailApplied indicates disagreement strong enough to trigger a floor
-    """
-    def level_from_distance(distance: int) -> int:
-        if distance >= 25:
-            return 2  # High
-        if distance >= 12:
-            return 1  # Medium
-        return 0  # Low
-
-    def clamp_level(level: int) -> int:
-        return max(0, min(2, level))
-
-    if finalRisk < 35:
-        distance = 35 - finalRisk
-    elif finalRisk >= 75:
-        distance = finalRisk - 75
-    else:
-        distance = min(finalRisk - 35, 75 - finalRisk)
-
-    level = level_from_distance(int(distance))
-
-    if not aiAvailable:
-        return ["Low", "Medium", "High"][min(level, 1)]
-
-    disagreement = abs(int(rulesRisk) - int(aiRisk))
-    if disagreement > 60:
-        level -= 2
-    elif disagreement > 40:
-        level -= 1
-
-    if guardrailApplied:
-        level -= 1
-
-    level = clamp_level(level)
-    return ["Low", "Medium", "High"][level]
-
-def confidenceFromAgreement(rulesRisk: int, aiRisk: int, aiAvailable: bool) -> str:
-    """Compute a user-facing confidence label."""
-    if not aiAvailable:
-        return "Low"
-    difference = abs(rulesRisk - aiRisk)
-    if difference <= 15:
-        return "High"
-    if difference <= 35:
-        return "Medium"
-    return "Low"
-
-
-# =====================================================================
-# Rules engine
-# =====================================================================
-
-def runRulesEngine(subject: str, sender: str, body: str, features: EmailFeatures) -> Tuple[int, Dict[str, Any], List[Dict[str, Any]]]:
-    """
-    Produce a deterministic rules-based risk score and structured breakdown.
-
-    Returns:
-        rulesRisk: int 0..100
-        breakdown: dict with component risks and short notes
-        reasons: list of signals (id/title/points/evidence)
-    """
-    normalized = normalizeText(subject, body)
-
-    reasons: List[Dict[str, Any]] = []
-    breakdown: Dict[str, Any] = {
-        "sender": {"risk": 0, "notes": []},
-        "links": {"risk": 0, "notes": [], "linkCount": len(features.urls), "domains": features.domains},
-        "content": {"risk": 0, "notes": []},
-        "attachments": {"risk": 0, "notes": []},
-    }
-
-    totalRisk = 0
-
-    urgencyKeywords = ["urgent", "immediately", "verify", "password", "suspended", "limited", "invoice", "payment"]
-    matchedUrgency = next((keyword for keyword in urgencyKeywords if keyword in normalized), None)
-    if matchedUrgency:
-        points = 60
-        totalRisk += points
-        breakdown["content"]["risk"] = max(breakdown["content"]["risk"], points)
-        breakdown["content"]["notes"].append(f"Pressure language detected: '{matchedUrgency}'")
-        reasons.append({
-            "id": "pressureLanguage",
-            "title": "Pressure or urgency language",
-            "points": points,
-            "evidence": f"Keyword '{matchedUrgency}' appears in subject/body",
-        })
-
-    if features.containsShortenedLinks:
-        points = 25
-        totalRisk += points
-        breakdown["links"]["risk"] = max(breakdown["links"]["risk"], points)
-        breakdown["links"]["notes"].append("Link shortener detected")
-        reasons.append({
-            "id": "shortenedLinks",
-            "title": "URL shortener detected",
-            "points": points,
-            "evidence": "At least one URL uses a known shortener domain",
-        })
-
-    if features.containsHttpLinks:
-        points = 10
-        totalRisk += points
-        breakdown["links"]["risk"] = max(breakdown["links"]["risk"], points)
-        breakdown["links"]["notes"].append("Non-HTTPS link detected")
-        reasons.append({
-            "id": "nonHttpsLinks",
-            "title": "Non-HTTPS link",
-            "points": points,
-            "evidence": "At least one URL starts with http://",
-        })
-
-    if features.containsMixedScriptText:
-        points = 15
-        totalRisk += points
-        breakdown["sender"]["risk"] = max(breakdown["sender"]["risk"], points)
-        breakdown["sender"]["notes"].append("Mixed-script text may indicate spoofing")
-        reasons.append({
-            "id": "mixedScript",
-            "title": "Potential homograph / spoofing indicators",
-            "points": points,
-            "evidence": "Latin characters appear together with non-ASCII characters",
-        })
-
-    rulesRisk = int(clamp(totalRisk, 0, 100))
-    for sectionName in ["sender", "links", "content", "attachments"]:
-        breakdown[sectionName]["risk"] = int(clamp(breakdown[sectionName]["risk"], 0, 100))
-
-    return rulesRisk, breakdown, reasons
-
-
 # =====================================================================
 # Gemini integration
 # =====================================================================
 
-def buildAiPrompt(subject: str, sender: str, body: str, features: EmailFeatures) -> str:
-    """
-    Build a strict prompt asking Gemini to produce machine-parseable JSON only.
-
-    The JSON is used directly in a user-facing security UI, so the model must:
-      - Avoid hallucinations
-      - Be concise
-      - Provide evidence-based findings
-    """
-    schema = {
-        "aiRisk": "integer 0..100",
-        "threatType": "one of: safe|phishing|malware|bec|invoice|other",
-        "summary": "max 2 short sentences",
-        "keyFindings": ["max 4 bullets, each <= 14 words, evidence-based"],
-        "recommendedAction": "one short sentence",
-    }
-
-    prompt = f"""
-You are an email security analyst.
-
-Return ONLY valid JSON that matches this schema exactly:
-{json.dumps(schema, indent=2)}
-
-Hard rules:
-- Output must be JSON only. No markdown, no commentary.
-- aiRisk is 0..100 where 0 is safe, 100 is highly malicious.
-- Do NOT invent facts. If something cannot be verified from the email text, do not claim it.
-- summary: <= 2 short sentences.
-- keyFindings: <= 4 items, each <= 14 words, focus on what matters for a user.
-- recommendedAction: exactly 1 short sentence, user-facing.
-
-Email context:
-Subject: {subject}
-Sender: {sender}
-
-Extracted domains: {", ".join(features.domains) if features.domains else "(none)"}
-URL count: {len(features.urls)}
-
-Body (truncated):
-{body[:8000]}
-""".strip()
-
-    return prompt
-
-
 def getGeminiClient(apiKey: str) -> genai.Client:
-    """Create a Gemini client pinned to the stable v1 API."""
     return genai.Client(
         api_key=apiKey,
         http_options=types.HttpOptions(api_version="v1"),
@@ -365,11 +155,6 @@ def getGeminiClient(apiKey: str) -> genai.Client:
 
 
 def pickWorkingModel(client: genai.Client) -> str:
-    """
-    Pick the first model that supports generateContent in the current project.
-
-    Caches the selection in-process to avoid repeated test calls.
-    """
     global selectedModel
     if selectedModel:
         return selectedModel
@@ -387,15 +172,99 @@ def pickWorkingModel(client: genai.Client) -> str:
 
 
 def parseFirstJsonObject(text: str) -> Dict[str, Any]:
-    """Extract and parse the first JSON object from a string."""
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
         raise ValueError("AI response did not contain a JSON object.")
     return json.loads(match.group(0))
 
 
-def callGemini(subject: str, sender: str, body: str, features: EmailFeatures) -> Dict[str, Any]:
-    """Call Gemini and return the parsed JSON payload."""
+def buildAiScoringPrompt(
+    request: AnalyzeRequest,
+    features: EmailFeatures,
+) -> str:
+    schema = {
+        "hardChecks": [
+            {
+                "id": "string",
+                "title": "string",
+                "maxPoints": "int",
+                "triggered": "bool",
+                "riskPoints": "int 0..maxPoints",
+                "evidence": "short quote or exact indicator, <= 120 chars"
+            }
+        ],
+        "freeAssessment": {
+            "risk": "int 0..100",
+            "threatType": "safe|phishing|malware|bec|invoice|other",
+            "summary": "max 2 short sentences",
+            "keyFindings": ["<= 4 bullets, each <= 14 words"],
+            "recommendedAction": "one short sentence"
+        },
+        "confidence": {
+            "label": "Low|Medium|High",
+            "score": "int 0..100",
+            "rationale": ["<= 4 short bullets, evidence-based"]
+        }
+    }
+
+    hardChecksCatalog = [
+        {"id": "authFails", "title": "Email authentication failed (SPF/DKIM/DMARC)", "maxPoints": 40},
+        {"id": "authMissing", "title": "Email authentication missing/unknown", "maxPoints": 15},
+        {"id": "replyToMismatch", "title": "Reply-To / Return-Path mismatch", "maxPoints": 20},
+        {"id": "lookalikeOrHomograph", "title": "Potential lookalike / homograph spoofing", "maxPoints": 25},
+        {"id": "httpLink", "title": "Non-HTTPS link present", "maxPoints": 10},
+        {"id": "shortenedLink", "title": "URL shortener present", "maxPoints": 20},
+        {"id": "credentialHarvesting", "title": "Asks for password/credit-card/verification", "maxPoints": 40},
+        {"id": "pressureLanguage", "title": "Pressure/urgency language", "maxPoints": 20},
+    ]
+
+    hardChecksJson = json.dumps(hardChecksCatalog, indent=2)
+
+    prompt = f"""
+You are an email security scoring engine.
+
+Return ONLY valid JSON matching this schema exactly:
+{json.dumps(schema, indent=2)}
+
+Rules:
+- Output must be JSON only. No markdown, no extra keys.
+- Do NOT invent facts. Every claim must be directly supported by the provided email text or metadata.
+- "this is phishing" inside the email is NOT proof by itself. Treat it as weak evidence unless other indicators exist.
+- hardChecks must cover EVERY item in the following catalog exactly once, in the same order.
+- For each hardChecks item:
+  - triggered is true/false based on the evidence.
+  - riskPoints is 0..maxPoints, proportional to evidence strength.
+  - evidence must quote or point to the exact indicator (keyword/domain/auth status), <= 120 chars.
+- freeAssessment.risk is your holistic risk (0 safe, 100 highly malicious).
+- confidence is confidence in the VERDICT class (Safe/Suspicious/Malicious), not confidence in the numeric risk.
+  - High confidence requires strong, consistent evidence.
+  - Low confidence if evidence is weak, ambiguous, or looks like a test email.
+
+Hard checks catalog (must be used exactly):
+{hardChecksJson}
+
+Email metadata:
+Subject: {request.subject}
+Sender: {request.sender}
+fromDomain: {request.fromDomain}
+replyToDomain: {request.replyToDomain}
+returnPathDomain: {request.returnPathDomain}
+authentication: spf={request.authentication.spf}, dkim={request.authentication.dkim}, dmarc={request.authentication.dmarc}
+
+Extracted URLs count: {len(features.urls)}
+Extracted URL domains: {", ".join(features.domains) if features.domains else "(none)"}
+containsHttpLinks: {features.containsHttpLinks}
+containsShortenedLinks: {features.containsShortenedLinks}
+containsMixedScriptText: {features.containsMixedScriptText}
+
+Body (truncated):
+{request.body[:8000]}
+""".strip()
+
+    return prompt
+
+
+def callGeminiScoring(request: AnalyzeRequest, features: EmailFeatures) -> Dict[str, Any]:
     apiKey = os.getenv(geminiApiKeyEnvironmentVariable, "").strip()
     if not apiKey:
         raise RuntimeError(f"Missing {geminiApiKeyEnvironmentVariable} environment variable.")
@@ -403,133 +272,155 @@ def callGemini(subject: str, sender: str, body: str, features: EmailFeatures) ->
     client = getGeminiClient(apiKey)
     modelName = pickWorkingModel(client)
 
-    prompt = buildAiPrompt(subject, sender, body, features)
+    prompt = buildAiScoringPrompt(request, features)
     response = client.models.generate_content(model=modelName, contents=prompt)
 
     rawText = (response.text or "").strip()
     parsed = parseFirstJsonObject(rawText)
 
-    aiRisk = int(clamp(float(parsed.get("aiRisk", 0)), 0, 100))
-    threatType = str(parsed.get("threatType", "other"))
-    summary = str(parsed.get("summary", "")).strip()
-
-    keyFindingsValue = parsed.get("keyFindings", [])
-    if not isinstance(keyFindingsValue, list):
-        keyFindingsValue = []
-    keyFindings = [str(item).strip() for item in keyFindingsValue if str(item).strip()][:4]
-
-    recommendedAction = str(parsed.get("recommendedAction", "")).strip()
-
-    return {
-        "aiRisk": aiRisk,
-        "threatType": threatType,
-        "summary": summary,
-        "keyFindings": keyFindings,
-        "recommendedAction": recommendedAction,
-        "model": modelName,
-    }
+    parsed["_meta"] = {"model": modelName}
+    return parsed
 
 
-def analyzeWithGemini(subject: str, sender: str, body: str, features: EmailFeatures) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Analyze email with Gemini using a hard timeout.
-
-    Returns:
-        (aiAvailable, aiPayload)
-    """
+def analyzeWithGemini(request: AnalyzeRequest, features: EmailFeatures) -> Tuple[bool, Dict[str, Any]]:
     start = time.time()
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(callGemini, subject, sender, body, features)
-            aiData = future.result(timeout=aiTimeoutSeconds)
+            future = executor.submit(callGeminiScoring, request, features)
+            data = future.result(timeout=aiTimeoutSeconds)
 
         latencyMs = int((time.time() - start) * 1000)
-        aiData["latencyMs"] = latencyMs
-        aiData["error"] = ""
-        return True, aiData
+        data["_meta"]["latencyMs"] = latencyMs
+        data["_meta"]["error"] = ""
+        return True, data
 
     except FuturesTimeoutError:
         latencyMs = int((time.time() - start) * 1000)
         return False, {
-            "aiRisk": 0,
-            "threatType": "other",
-            "summary": "",
-            "keyFindings": [],
-            "recommendedAction": "",
-            "model": "",
-            "latencyMs": latencyMs,
-            "error": f"AI timeout after {aiTimeoutSeconds}s",
+            "hardChecks": [],
+            "freeAssessment": {
+                "risk": 0,
+                "threatType": "other",
+                "summary": "",
+                "keyFindings": [],
+                "recommendedAction": "",
+            },
+            "confidence": {"label": "Low", "score": 0, "rationale": [f"AI timeout after {aiTimeoutSeconds}s"]},
+            "_meta": {"model": "", "latencyMs": latencyMs, "error": f"AI timeout after {aiTimeoutSeconds}s"},
         }
 
     except Exception as exception:
         latencyMs = int((time.time() - start) * 1000)
         return False, {
-            "aiRisk": 0,
-            "threatType": "other",
-            "summary": "",
-            "keyFindings": [],
-            "recommendedAction": "",
-            "model": "",
-            "latencyMs": latencyMs,
-            "error": str(exception),
+            "hardChecks": [],
+            "freeAssessment": {
+                "risk": 0,
+                "threatType": "other",
+                "summary": "",
+                "keyFindings": [],
+                "recommendedAction": "",
+            },
+            "confidence": {"label": "Low", "score": 0, "rationale": [str(exception)]},
+            "_meta": {"model": "", "latencyMs": latencyMs, "error": str(exception)},
         }
 
-
 # =====================================================================
-# Risk fusion (rules + AI)
+# Scoring + UI mapping
 # =====================================================================
 
-def fuseRisk(rulesRisk: int, aiRisk: int, aiAvailable: bool) -> Tuple[int, bool]:
-    """
-    Fuse risk into a single score with a guardrail.
+def computeHardRisk(hardChecks: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
+    reasons: List[Dict[str, Any]] = []
+    total = 0
 
-    Guardrail: if rules detect very high risk, the final risk cannot drop too low.
-    """
-    if not aiAvailable:
-        return int(clamp(rulesRisk, 0, 100)), False
+    for item in hardChecks:
+        triggered = bool(item.get("triggered", False))
+        maxPoints = int(item.get("maxPoints", 0) or 0)
+        riskPoints = int(item.get("riskPoints", 0) or 0)
+        riskPoints = int(clamp(riskPoints, 0, maxPoints))
 
-    base = rulesWeight * rulesRisk + aiWeight * aiRisk
-    minimum = 0.50 * rulesRisk if rulesRisk >= 70 else 0.0
-    finalRisk = max(base, minimum)
-    guardrailApplied = finalRisk != base
+        if triggered and riskPoints > 0:
+            total += riskPoints
+            reasons.append({
+                "id": str(item.get("id", "hardCheck")),
+                "title": str(item.get("title", "Hard check")),
+                "points": riskPoints,
+                "evidence": str(item.get("evidence", "")),
+            })
 
-    return int(clamp(finalRisk, 0, 100)), guardrailApplied
+    return int(clamp(total, 0, 100)), reasons
 
 
-def buildUiSummary(verdict: str, confidence: str, reasons: List[Dict[str, Any]], aiData: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build compact UI fields for the add-on.
+def buildBreakdown(request: AnalyzeRequest, features: EmailFeatures, hardRisk: int, freeRisk: int) -> Dict[str, Any]:
+    identityRisk = 0
+    if request.authentication.spf == "fail" or request.authentication.dkim == "fail" or request.authentication.dmarc == "fail":
+        identityRisk = max(identityRisk, 70)
+    elif request.authentication.spf == "unknown" and request.authentication.dkim == "unknown" and request.authentication.dmarc == "unknown":
+        identityRisk = max(identityRisk, 25)
 
-    This is what the user should see first: short findings and one action.
-    """
-    topReasons = sorted(reasons, key=lambda item: int(item.get("points", 0)), reverse=True)[:3]
-    ruleFindings = [str(r.get("title", "")).strip() for r in topReasons if str(r.get("title", "")).strip()]
+    if request.replyToDomain and request.fromDomain and request.replyToDomain != request.fromDomain:
+        identityRisk = max(identityRisk, 40)
 
-    aiFindings = aiData.get("keyFindings", [])
-    if not isinstance(aiFindings, list):
-        aiFindings = []
+    linksRisk = 0
+    if features.containsHttpLinks:
+        linksRisk = max(linksRisk, 20)
+    if features.containsShortenedLinks:
+        linksRisk = max(linksRisk, 35)
 
-    mergedFindings = []
-    for item in ruleFindings + [str(x).strip() for x in aiFindings if str(x).strip()]:
-        if item and item not in mergedFindings:
-            mergedFindings.append(item)
-        if len(mergedFindings) >= 4:
-            break
-
-    recommendedAction = aiData.get("recommendedAction", "")
-    if not recommendedAction:
-        if verdict == "Malicious":
-            recommendedAction = "Do not click anything; report as phishing and verify via official channel."
-        elif verdict == "Suspicious":
-            recommendedAction = "Verify sender and links before taking any action."
-        else:
-            recommendedAction = "No action needed; stay cautious with unexpected requests."
+    contentRisk = 0
+    if features.containsMixedScriptText:
+        contentRisk = max(contentRisk, 30)
 
     return {
-        "keyFindings": mergedFindings,
-        "recommendedAction": recommendedAction,
+        "identity": {
+            "risk": int(clamp(identityRisk, 0, 100)),
+            "fromDomain": request.fromDomain,
+            "replyToDomain": request.replyToDomain,
+            "returnPathDomain": request.returnPathDomain,
+            "authentication": {
+                "spf": request.authentication.spf,
+                "dkim": request.authentication.dkim,
+                "dmarc": request.authentication.dmarc,
+            },
+        },
+        "links": {
+            "risk": int(clamp(linksRisk, 0, 100)),
+            "linkCount": len(features.urls),
+            "domains": features.domains,
+            "containsHttpLinks": features.containsHttpLinks,
+            "containsShortenedLinks": features.containsShortenedLinks,
+        },
+        "content": {
+            "risk": int(clamp(contentRisk, 0, 100)),
+            "containsMixedScriptText": features.containsMixedScriptText,
+        },
+        "engine": {
+            "hardRisk": hardRisk,
+            "freeRisk": freeRisk,
+            "weights": {"hard": hardChecksWeight, "free": 1.0 - hardChecksWeight},
+        },
     }
 
+
+def buildUiSummary(aiPayload: Dict[str, Any], hardReasons: List[Dict[str, Any]]) -> Dict[str, Any]:
+    free = aiPayload.get("freeAssessment", {}) if isinstance(aiPayload.get("freeAssessment", {}), dict) else {}
+    keyFindings = free.get("keyFindings", [])
+    if not isinstance(keyFindings, list):
+        keyFindings = []
+
+    hardFindings = [str(r.get("title", "")).strip() for r in sorted(hardReasons, key=lambda x: int(x.get("points", 0)), reverse=True)[:2]]
+    merged = []
+    for item in hardFindings + [str(x).strip() for x in keyFindings]:
+        if item and item not in merged:
+            merged.append(item)
+        if len(merged) >= 4:
+            break
+
+    recommendedAction = str(free.get("recommendedAction", "")).strip()
+
+    return {
+        "keyFindings": merged,
+        "recommendedAction": recommendedAction,
+    }
 
 # =====================================================================
 # FastAPI routes
@@ -537,59 +428,69 @@ def buildUiSummary(verdict: str, confidence: str, reasons: List[Dict[str, Any]],
 
 @app.get("/")
 def health() -> Dict[str, str]:
-    """Health endpoint used by Render and manual checks."""
     return {"status": "running", "version": applicationVersion}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
-    """Analyze a single email and return a structured security assessment."""
     traceId = str(uuid4())
 
-    subject = request.subject or ""
-    sender = request.sender or ""
-    body = request.body or ""
+    features = computeFeatures(request.subject, request.sender, request.body)
 
-    features = computeFeatures(subject, sender, body)
-    rulesRisk, breakdown, reasons = runRulesEngine(subject, sender, body, features)
+    aiAvailable, aiPayload = analyzeWithGemini(request, features)
 
-    aiAvailable, aiData = analyzeWithGemini(subject, sender, body, features)
-    aiRisk = int(aiData.get("aiRisk", 0)) if aiAvailable else 0
+    hardChecks = aiPayload.get("hardChecks", [])
+    if not isinstance(hardChecks, list):
+        hardChecks = []
 
-    finalRisk, guardrailApplied = fuseRisk(rulesRisk, aiRisk, aiAvailable)
+    hardRisk, hardReasons = computeHardRisk(hardChecks)
+
+    freeAssessment = aiPayload.get("freeAssessment", {}) if isinstance(aiPayload.get("freeAssessment", {}), dict) else {}
+    freeRisk = int(clamp(float(freeAssessment.get("risk", 0) or 0), 0, 100))
+
+    finalRisk = hardChecksWeight * hardRisk + (1.0 - hardChecksWeight) * freeRisk
+    finalRisk = int(clamp(finalRisk, 0, 100))
+
     verdict = verdictFromRisk(finalRisk)
-    confidence = confidenceFromClassification(
-        finalRisk=finalRisk,
-        rulesRisk=rulesRisk,
-        aiRisk=aiRisk,
-        aiAvailable=aiAvailable,
-        guardrailApplied=guardrailApplied
-    )
     safetyScore = int(clamp(100 - finalRisk, 0, 100))
 
-    ui = buildUiSummary(verdict, confidence, reasons, aiData)
+    confidence = aiPayload.get("confidence", {}) if isinstance(aiPayload.get("confidence", {}), dict) else {}
+    confidenceLabel = str(confidence.get("label", "Low"))
+    if confidenceLabel not in ["Low", "Medium", "High"]:
+        confidenceLabel = "Low"
+    confidenceScore = int(clamp(float(confidence.get("score", 0) or 0), 0, 100))
+
+    rationale = confidence.get("rationale", [])
+    if not isinstance(rationale, list):
+        rationale = []
+    rationale = [str(x).strip() for x in rationale if str(x).strip()][:4]
+
+    breakdown = buildBreakdown(request, features, hardRisk, freeRisk)
+    ui = buildUiSummary(aiPayload, hardReasons)
 
     response = {
         "score": safetyScore,
         "verdict": verdict,
-        "confidence": confidence,
+        "confidence": confidenceLabel,
         "risk": {
             "final": finalRisk,
-            "rules": int(clamp(rulesRisk, 0, 100)),
-            "ai": int(clamp(aiRisk, 0, 100)),
-            "weights": {"rules": rulesWeight, "ai": aiWeight},
-            "guardrailApplied": guardrailApplied,
+            "hard": hardRisk,
+            "free": freeRisk,
+            "weights": {"hard": hardChecksWeight, "free": 1.0 - hardChecksWeight},
+            "confidenceScore": confidenceScore,
+            "confidenceRationale": rationale,
         },
         "breakdown": breakdown,
-        "reasons": reasons,
+        "reasons": hardReasons,
         "ai": {
-            "summary": aiData.get("summary", ""),
-            "threatType": aiData.get("threatType", "other"),
-            "keyFindings": aiData.get("keyFindings", []),
-            "recommendedAction": aiData.get("recommendedAction", ""),
-            "model": aiData.get("model", ""),
-            "latencyMs": aiData.get("latencyMs", 0),
-            "error": aiData.get("error", ""),
+            "summary": str(freeAssessment.get("summary", "")).strip(),
+            "threatType": str(freeAssessment.get("threatType", "other")).strip(),
+            "keyFindings": freeAssessment.get("keyFindings", []),
+            "recommendedAction": str(freeAssessment.get("recommendedAction", "")).strip(),
+            "model": aiPayload.get("_meta", {}).get("model", ""),
+            "latencyMs": aiPayload.get("_meta", {}).get("latencyMs", 0),
+            "error": aiPayload.get("_meta", {}).get("error", ""),
+            "hardChecks": hardChecks,
         },
         "ui": ui,
         "version": applicationVersion,
