@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 applicationVersion = "3.0.0"
 
 hardChecksWeight = float(os.getenv("HARD_CHECKS_WEIGHT", "0.30"))
-aiTimeoutSeconds = float(os.getenv("AI_TIMEOUT_SECONDS", "12.0"))
+aiTimeoutSeconds = float(os.getenv("AI_TIMEOUT_SECONDS", "15.0"))
 geminiApiKeyEnvironmentVariable = "GEMINI_API_KEY"
 
 modelCandidates = [
