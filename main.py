@@ -163,6 +163,56 @@ def verdictFromRisk(risk: int) -> str:
     return "Safe"
 
 
+def confidenceFromClassification(
+    finalRisk: int,
+    rulesRisk: int,
+    aiRisk: int,
+    aiAvailable: bool,
+    guardrailApplied: bool
+) -> str:
+    """
+    Confidence is about classification stability (Safe/Suspicious/Malicious),
+    not about the raw risk magnitude.
+
+    Signals:
+    - distance from decision boundaries (35, 75)
+    - agreement between rules and AI (if AI available)
+    - guardrailApplied indicates disagreement strong enough to trigger a floor
+    """
+    def level_from_distance(distance: int) -> int:
+        if distance >= 25:
+            return 2  # High
+        if distance >= 12:
+            return 1  # Medium
+        return 0  # Low
+
+    def clamp_level(level: int) -> int:
+        return max(0, min(2, level))
+
+    if finalRisk < 35:
+        distance = 35 - finalRisk
+    elif finalRisk >= 75:
+        distance = finalRisk - 75
+    else:
+        distance = min(finalRisk - 35, 75 - finalRisk)
+
+    level = level_from_distance(int(distance))
+
+    if not aiAvailable:
+        return ["Low", "Medium", "High"][min(level, 1)]
+
+    disagreement = abs(int(rulesRisk) - int(aiRisk))
+    if disagreement > 60:
+        level -= 2
+    elif disagreement > 40:
+        level -= 1
+
+    if guardrailApplied:
+        level -= 1
+
+    level = clamp_level(level)
+    return ["Low", "Medium", "High"][level]
+
 def confidenceFromAgreement(rulesRisk: int, aiRisk: int, aiAvailable: bool) -> str:
     """Compute a user-facing confidence label."""
     if not aiAvailable:
@@ -508,7 +558,13 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
 
     finalRisk, guardrailApplied = fuseRisk(rulesRisk, aiRisk, aiAvailable)
     verdict = verdictFromRisk(finalRisk)
-    confidence = confidenceFromAgreement(rulesRisk, aiRisk, aiAvailable)
+    confidence = confidenceFromClassification(
+        finalRisk=finalRisk,
+        rulesRisk=rulesRisk,
+        aiRisk=aiRisk,
+        aiAvailable=aiAvailable,
+        guardrailApplied=guardrailApplied
+    )
     safetyScore = int(clamp(100 - finalRisk, 0, 100))
 
     ui = buildUiSummary(verdict, confidence, reasons, aiData)
