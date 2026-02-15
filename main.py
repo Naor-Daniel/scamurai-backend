@@ -886,45 +886,50 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     if aiDisabledByUser:
         aiOffReasonRaw = "Disabled in Settings"
     else:
-        aiOffReasonRaw = str((aiPayload.get("_meta", {}) or {}).get("error", "")).strip() if isinstance(aiPayload,
-                                                                                                        dict) else ""
+        aiOffReasonRaw = str((aiPayload.get("_meta", {}) or {}).get("error", "")).strip() if isinstance(aiPayload, dict) else ""
         if not aiOffReasonRaw:
             aiOffReasonRaw = "AI unavailable"
 
     aiOffReason = sanitizeAiErrorReason(aiOffReasonRaw) or "AI unavailable"
 
+    # Always define hardChecks
     if aiAvailable:
         hardChecks = aiPayload.get("hardChecks", [])
         if not isinstance(hardChecks, list):
-            hardChecks = []
-        else:
             hardChecks = fallbackHardChecks(request, features, settings, urlRep)
+            aiAvailable = False
+            aiStatus = "off"
+            aiOffReason = "AI returned invalid hardChecks; used deterministic fallback."
+    else:
+        hardChecks = fallbackHardChecks(request, features, settings, urlRep)
 
-            if aiDisabledByUser:
-                aiReason = "AI disabled by user."
-            else:
-                aiReason = "AI unavailable; used deterministic fallback checks only."
+    # If AI is unavailable or disabled, normalize aiPayload to a consistent fallback shape
+    if not aiAvailable:
+        if aiDisabledByUser:
+            aiReason = "AI disabled by user."
+        else:
+            aiReason = "AI unavailable; used deterministic fallback checks only."
 
-            aiPayload = {
-                "hardChecks": hardChecks,
-                "freeAssessment": {
-                    "risk": 0,
-                    "threatType": "other",
-                    "summary": "",
-                    "keyFindings": [],
-                    "recommendedAction": "",
-                },
-                "confidence": {
-                    "label": "Low",
-                    "score": 0,
-                    "rationale": [aiReason],
-                },
-                "_meta": {
-                    "model": "",
-                    "latencyMs": 0,
-                    "error": aiOffReason,
-                },
-            }
+        aiPayload = {
+            "hardChecks": hardChecks,
+            "freeAssessment": {
+                "risk": 0,
+                "threatType": "other",
+                "summary": "",
+                "keyFindings": [],
+                "recommendedAction": "",
+            },
+            "confidence": {
+                "label": "Low",
+                "score": 0,
+                "rationale": [aiReason],
+            },
+            "_meta": {
+                "model": "",
+                "latencyMs": 0,
+                "error": aiOffReason,
+            },
+        }
 
     hardRisk, hardReasons = computeHardRisk(hardChecks)
 
@@ -1001,9 +1006,8 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             "threatType": str(freeAssessment.get("threatType", "other")).strip(),
             "keyFindings": freeAssessment.get("keyFindings", []),
             "recommendedAction": str(freeAssessment.get("recommendedAction", "")).strip(),
-            "model": aiPayload.get("_meta", {}).get("model", ""),
-            "latencyMs": aiPayload.get("_meta", {}).get("latencyMs", 0),
-
+            "model": (aiPayload.get("_meta", {}) or {}).get("model", "") if isinstance(aiPayload, dict) else "",
+            "latencyMs": (aiPayload.get("_meta", {}) or {}).get("latencyMs", 0) if isinstance(aiPayload, dict) else 0,
             "error": "" if aiAvailable else aiOffReason,
             "hardChecks": hardChecks,
             "confidence": {"label": confidenceLabel, "score": confidenceScore, "rationale": rationale},
