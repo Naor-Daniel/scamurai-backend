@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 # Application configuration
 # =====================================================================
 
-applicationVersion = "3.2.0"
+applicationVersion = "3.3.0"
 
 defaultHardChecksWeight = float(os.getenv("HARD_CHECKS_WEIGHT", "0.30"))
 aiTimeoutSeconds = float(os.getenv("AI_TIMEOUT_SECONDS", "20.0"))
@@ -49,11 +49,7 @@ class AuthenticationSummary(BaseModel):
 
 
 class UserSettings(BaseModel):
-    """
-    Settings are user-controlled and sent by the add-on on every /analyze call.
-    The backend treats them as preferences, not as trusted facts.
-    """
-    sensitivity: str = "balanced"  # lenient|balanced|strict
+    sensitivity: str = "balanced"
     hardChecksWeight: float = Field(defaultHardChecksWeight, ge=0.0, le=1.0)
 
     allowlistedDomains: List[str] = Field(default_factory=list)
@@ -62,7 +58,9 @@ class UserSettings(BaseModel):
     treatAuthUnknownAsRisk: bool = True
     assumeTestEmailIfContainsTestingWords: bool = True
 
-    language: str = "en"  # en|he
+    language: str = "en"
+    aiEnabled: bool = True
+    viewMode: str = "basic"
 
 
 class AnalyzeRequest(BaseModel):
@@ -86,7 +84,7 @@ class RiskReason(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    score: int = Field(ge=0, le=100)  # safety score
+    score: int = Field(ge=0, le=100)
     verdict: str
     confidence: str
     risk: dict
@@ -112,7 +110,7 @@ class EmailFeatures:
 
 @dataclass(frozen=True)
 class UrlReputation:
-    status: str  # ok|unavailable|error|rate_limited
+    status: str
     maliciousUrls: List[str]
     checkedCount: int
     error: str = ""
@@ -194,6 +192,10 @@ def sanitizeSettings(settings: UserSettings) -> UserSettings:
     if language not in ["en", "he"]:
         language = "en"
 
+    viewMode = str(settings.viewMode or "basic").strip().lower()
+    if viewMode not in ["basic", "advanced"]:
+        viewMode = "basic"
+
     return UserSettings(
         sensitivity=sensitivity,
         hardChecksWeight=hardWeight,
@@ -202,6 +204,8 @@ def sanitizeSettings(settings: UserSettings) -> UserSettings:
         treatAuthUnknownAsRisk=bool(settings.treatAuthUnknownAsRisk),
         assumeTestEmailIfContainsTestingWords=bool(settings.assumeTestEmailIfContainsTestingWords),
         language=language,
+        aiEnabled=bool(settings.aiEnabled),
+        viewMode=viewMode,
     )
 
 
@@ -591,10 +595,6 @@ def fallbackHardChecks(
     settings: UserSettings,
     urlRep: UrlReputation,
 ) -> List[Dict[str, Any]]:
-    """
-    Deterministic scoring used ONLY when AI is unavailable.
-    This is a strict, evidence-only ruleset.
-    """
     normalized = normalizeText(request.subject, request.body)
 
     testingWords = [
@@ -796,6 +796,8 @@ def buildBreakdown(
             "allowlistedDomains": settings.allowlistedDomains,
             "blocklistedDomains": settings.blocklistedDomains,
             "language": settings.language,
+            "aiEnabled": settings.aiEnabled,
+            "viewMode": settings.viewMode,
         },
     }
 
@@ -850,7 +852,12 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
 
     urlRep = checkUrlReputation(features.urls)
 
-    aiAvailable, aiPayload = analyzeWithGemini(request, features, settings, urlRep)
+    aiAvailable = False
+    aiPayload: Dict[str, Any] = {}
+
+    aiDisabledByUser = not settings.aiEnabled
+    if not aiDisabledByUser:
+        aiAvailable, aiPayload = analyzeWithGemini(request, features, settings, urlRep)
 
     if aiAvailable:
         hardChecks = aiPayload.get("hardChecks", [])
@@ -858,6 +865,7 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             hardChecks = []
     else:
         hardChecks = fallbackHardChecks(request, features, settings, urlRep)
+        aiReason = "AI disabled by user." if aiDisabledByUser else "AI unavailable; used deterministic fallback checks only."
         aiPayload = {
             "hardChecks": hardChecks,
             "freeAssessment": {
@@ -870,12 +878,12 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             "confidence": {
                 "label": "Low",
                 "score": 0,
-                "rationale": ["AI unavailable; used deterministic fallback checks only."],
+                "rationale": [aiReason],
             },
             "_meta": {
                 "model": "",
                 "latencyMs": 0,
-                "error": "AI unavailable",
+                "error": "AI disabled" if aiDisabledByUser else "AI unavailable",
             },
         }
 
@@ -890,12 +898,14 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
         finalRisk = settings.hardChecksWeight * hardRisk + (1.0 - settings.hardChecksWeight) * freeRisk
         finalRisk = int(clamp(finalRisk, 0, 100))
 
-    verdict = verdictFromRisk(finalRisk) if aiAvailable else "Suspicious"
+    verdict = verdictFromRisk(finalRisk)
     safetyScore = int(clamp(100 - finalRisk, 0, 100))
 
     confidence = aiPayload.get("confidence", {}) if isinstance(aiPayload.get("confidence", {}), dict) else {}
     confidenceLabel = str(confidence.get("label", "Low"))
     if confidenceLabel not in ["Low", "Medium", "High"]:
+        confidenceLabel = "Low"
+    if not aiAvailable:
         confidenceLabel = "Low"
 
     confidenceScore = int(clamp(float(confidence.get("score", 0) or 0), 0, 100))
@@ -914,7 +924,7 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     response = {
         "score": safetyScore,
         "verdict": verdict,
-        "confidence": confidenceLabel if aiAvailable else "Low",
+        "confidence": confidenceLabel,
         "risk": {
             "final": finalRisk,
             "hard": hardRisk,
