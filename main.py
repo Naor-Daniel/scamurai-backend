@@ -14,12 +14,13 @@ from fastapi import FastAPI
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 
 # =====================================================================
 # Application configuration
 # =====================================================================
 
-applicationVersion = "3.3.0"
+applicationVersion = "3.4.0"
 
 defaultHardChecksWeight = float(os.getenv("HARD_CHECKS_WEIGHT", "0.30"))
 aiTimeoutSeconds = float(os.getenv("AI_TIMEOUT_SECONDS", "20.0"))
@@ -47,7 +48,6 @@ class AuthenticationSummary(BaseModel):
     dkim: str = "unknown"
     dmarc: str = "unknown"
 
-
 class UserSettings(BaseModel):
     sensitivity: str = "balanced"
     hardChecksWeight: float = Field(defaultHardChecksWeight, ge=0.0, le=1.0)
@@ -62,7 +62,6 @@ class UserSettings(BaseModel):
     aiEnabled: bool = True
     viewMode: str = "basic"
 
-
 class AnalyzeRequest(BaseModel):
     subject: str = ""
     sender: str = ""
@@ -75,13 +74,11 @@ class AnalyzeRequest(BaseModel):
     authentication: AuthenticationSummary = Field(default_factory=AuthenticationSummary)
     settings: UserSettings = Field(default_factory=UserSettings)
 
-
 class RiskReason(BaseModel):
     id: str
     title: str
     points: int = Field(ge=0, le=100)
     evidence: str = ""
-
 
 class AnalyzeResponse(BaseModel):
     score: int = Field(ge=0, le=100)
@@ -107,14 +104,12 @@ class EmailFeatures:
     containsShortenedLinks: bool
     containsMixedScriptText: bool
 
-
 @dataclass(frozen=True)
 class UrlReputation:
     status: str
     maliciousUrls: List[str]
     checkedCount: int
     error: str = ""
-
 
 # =====================================================================
 # Utility helpers
@@ -123,25 +118,20 @@ class UrlReputation:
 def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
-
 def normalizeDomain(value: str) -> str:
     return str(value or "").strip().lower()
 
-
 def normalizeText(subject: str, body: str) -> str:
     return (subject + "\n" + body).lower().strip()
-
 
 def extractUrls(text: str) -> List[str]:
     if not text:
         return []
     return re.findall(r"\bhttps?://[^\s<>\"]+", text, flags=re.IGNORECASE)[:50]
 
-
 def extractDomainFromUrl(url: str) -> str:
     match = re.match(r"^https?://([^/]+)", url.strip(), flags=re.IGNORECASE)
     return match.group(1).lower() if match else ""
-
 
 def containsMixedScript(text: str) -> bool:
     if not text:
@@ -149,7 +139,6 @@ def containsMixedScript(text: str) -> bool:
     hasLatin = bool(re.search(r"[A-Za-z]", text))
     hasNonAscii = bool(re.search(r"[^\x00-\x7F]", text))
     return hasLatin and hasNonAscii
-
 
 def computeFeatures(subject: str, sender: str, body: str) -> EmailFeatures:
     urls = extractUrls(body)
@@ -169,14 +158,12 @@ def computeFeatures(subject: str, sender: str, body: str) -> EmailFeatures:
         containsMixedScriptText=mixedScript,
     )
 
-
 def verdictFromRisk(risk: int) -> str:
     if risk >= 75:
         return "Malicious"
     if risk >= 35:
         return "Suspicious"
     return "Safe"
-
 
 def sanitizeSettings(settings: UserSettings) -> UserSettings:
     sensitivity = settings.sensitivity.strip().lower()
@@ -208,7 +195,6 @@ def sanitizeSettings(settings: UserSettings) -> UserSettings:
         viewMode=viewMode,
     )
 
-
 def domainIsListed(domain: str, listed: List[str]) -> bool:
     d = normalizeDomain(domain)
     if not d:
@@ -220,7 +206,6 @@ def domainIsListed(domain: str, listed: List[str]) -> bool:
         if d == item or d.endswith("." + item):
             return True
     return False
-
 
 # =====================================================================
 # Optional enrichment: Google Safe Browsing (URL reputation)
@@ -281,7 +266,6 @@ def checkUrlReputation(urls: List[str]) -> UrlReputation:
     except Exception as e:
         return UrlReputation(status="error", maliciousUrls=[], checkedCount=len(urls), error=str(e))
 
-
 # =====================================================================
 # Gemini integration (AI-active path)
 # =====================================================================
@@ -291,7 +275,6 @@ def getGeminiClient(apiKey: str) -> genai.Client:
         api_key=apiKey,
         http_options=types.HttpOptions(api_version="v1"),
     )
-
 
 def pickWorkingModel(client: genai.Client) -> str:
     global selectedModel
@@ -309,13 +292,11 @@ def pickWorkingModel(client: genai.Client) -> str:
 
     raise RuntimeError(f"No working Gemini model found. Last error: {lastError}")
 
-
 def parseFirstJsonObject(text: str) -> Dict[str, Any]:
     match = re.search(r"\{[\s\S]*\}", text)
     if not match:
         raise ValueError("AI response did not contain a JSON object.")
     return json.loads(match.group(0))
-
 
 def hardChecksCatalog() -> List[Dict[str, Any]]:
     return [
@@ -330,7 +311,6 @@ def hardChecksCatalog() -> List[Dict[str, Any]]:
         {"id": "maliciousUrlReputation", "title": "URL reputation indicates malicious or phishing", "maxPoints": 50},
         {"id": "brandImpersonation", "title": "Brand impersonation or fake login workflow", "maxPoints": 30},
     ]
-
 
 def buildAiScoringPrompt(
     request: AnalyzeRequest,
@@ -458,7 +438,6 @@ Body (truncated):
 
     return prompt
 
-
 def normalizeAiPayload(ai: Dict[str, Any]) -> Dict[str, Any]:
     catalog = hardChecksCatalog()
 
@@ -533,7 +512,6 @@ def normalizeAiPayload(ai: Dict[str, Any]) -> Dict[str, Any]:
         "_meta": meta,
     }
 
-
 def callGeminiScoring(request: AnalyzeRequest, features: EmailFeatures, settings: UserSettings, urlRep: UrlReputation) -> Dict[str, Any]:
     apiKey = os.getenv(geminiApiKeyEnvironmentVariable, "").strip()
     if not apiKey:
@@ -552,7 +530,6 @@ def callGeminiScoring(request: AnalyzeRequest, features: EmailFeatures, settings
 
     parsed["_meta"] = {"model": modelName}
     return normalizeAiPayload(parsed)
-
 
 def analyzeWithGemini(request: AnalyzeRequest, features: EmailFeatures, settings: UserSettings, urlRep: UrlReputation) -> Tuple[bool, Dict[str, Any]]:
     start = time.time()
@@ -751,6 +728,10 @@ def computeHardRisk(hardChecks: List[Dict[str, Any]]) -> Tuple[int, List[Dict[st
 # UI mapping
 # =====================================================================
 
+def utcNowIso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def buildBreakdown(
     request: AnalyzeRequest,
     features: EmailFeatures,
@@ -802,7 +783,7 @@ def buildBreakdown(
     }
 
 
-def buildUiSummary(aiPayload: Dict[str, Any], hardReasons: List[Dict[str, Any]]) -> Dict[str, Any]:
+def buildUiSummary(aiPayload: Dict[str, Any], hardReasons: List[Dict[str, Any]], language: str) -> Dict[str, Any]:
     free = aiPayload.get("freeAssessment", {}) if isinstance(aiPayload.get("freeAssessment", {}), dict) else {}
     keyFindings = free.get("keyFindings", [])
     if not isinstance(keyFindings, list):
@@ -810,7 +791,7 @@ def buildUiSummary(aiPayload: Dict[str, Any], hardReasons: List[Dict[str, Any]])
 
     hardFindings = [
         str(r.get("title", "")).strip()
-        for r in sorted(hardReasons, key=lambda x: int(x.get("points", 0)), reverse=True)[:2]
+        for r in sorted(hardReasons, key=lambda x: int(x.get("points", 0)), reverse=True)[:3]
     ]
 
     merged: List[str] = []
@@ -819,6 +800,9 @@ def buildUiSummary(aiPayload: Dict[str, Any], hardReasons: List[Dict[str, Any]])
             merged.append(item)
         if len(merged) >= 4:
             break
+
+    if not merged:
+        merged = ["No meaningful risk indicators detected."] if language != "he" else ["לא זוהו אינדיקציות סיכון משמעותיות."]
 
     recommendedAction = str(free.get("recommendedAction", "")).strip()
 
@@ -846,6 +830,7 @@ def health() -> Dict[str, str]:
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     traceId = str(uuid4())
+    analyzedAt = utcNowIso()
 
     settings = sanitizeSettings(request.settings)
     features = computeFeatures(request.subject, request.sender, request.body)
@@ -859,13 +844,21 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     if not aiDisabledByUser:
         aiAvailable, aiPayload = analyzeWithGemini(request, features, settings, urlRep)
 
+    aiStatus = "on" if aiAvailable else "off"
+    if aiDisabledByUser:
+        aiOffReason = "Disabled in Settings"
+    else:
+        aiOffReason = str((aiPayload.get("_meta", {}) or {}).get("error", "")).strip() if isinstance(aiPayload, dict) else ""
+        if not aiOffReason:
+            aiOffReason = "AI unavailable"
+
     if aiAvailable:
         hardChecks = aiPayload.get("hardChecks", [])
         if not isinstance(hardChecks, list):
             hardChecks = []
     else:
         hardChecks = fallbackHardChecks(request, features, settings, urlRep)
-        aiReason = "AI disabled by user." if aiDisabledByUser else "AI unavailable; used deterministic fallback checks only."
+        aiReason = "AI disabled by user." if aiDisabledByUser else f"AI unavailable; used deterministic fallback checks only. ({aiOffReason})"
         aiPayload = {
             "hardChecks": hardChecks,
             "freeAssessment": {
@@ -883,7 +876,7 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             "_meta": {
                 "model": "",
                 "latencyMs": 0,
-                "error": "AI disabled" if aiDisabledByUser else "AI unavailable",
+                "error": "AI disabled" if aiDisabledByUser else aiOffReason,
             },
         }
 
@@ -909,6 +902,8 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
         confidenceLabel = "Low"
 
     confidenceScore = int(clamp(float(confidence.get("score", 0) or 0), 0, 100))
+    if not aiAvailable:
+        confidenceScore = 0
 
     rationale = confidence.get("rationale", [])
     if not isinstance(rationale, list):
@@ -916,10 +911,29 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
     rationale = [str(x).strip() for x in rationale if str(x).strip()][:4]
 
     breakdown = buildBreakdown(request, features, urlRep, hardRisk, freeRisk, settings)
-    ui = buildUiSummary(aiPayload, hardReasons)
+    ui = buildUiSummary(aiPayload, hardReasons, settings.language)
 
     if not ui.get("recommendedAction"):
         ui["recommendedAction"] = defaultActionForFallback(settings.language) if not aiAvailable else ""
+
+    ui["meta"] = {
+        "analyzedAt": analyzedAt,
+        "ai": {
+            "status": aiStatus,
+            "reason": "" if aiAvailable else aiOffReason,
+            "model": str((aiPayload.get("_meta", {}) or {}).get("model", "")) if isinstance(aiPayload, dict) else "",
+            "latencyMs": int((aiPayload.get("_meta", {}) or {}).get("latencyMs", 0)) if isinstance(aiPayload, dict) else 0,
+        },
+        "safeBrowsing": {
+            "status": urlRep.status,
+            "checkedCount": urlRep.checkedCount,
+            "maliciousCount": len(urlRep.maliciousUrls),
+            "error": urlRep.error,
+        },
+        "confidenceHelp": "Confidence measures the stability of the verdict (Safe/Suspicious/Malicious), not the exact number.",
+    }
+    if settings.language == "he":
+        ui["meta"]["confidenceHelp"] = "ביטחון (Confidence) מודד יציבות של הסיווג (Safe/Suspicious/Malicious), לא את הדיוק של המספר."
 
     response = {
         "score": safetyScore,
@@ -946,6 +960,8 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             "error": aiPayload.get("_meta", {}).get("error", ""),
             "hardChecks": hardChecks,
             "confidence": {"label": confidenceLabel, "score": confidenceScore, "rationale": rationale},
+            "status": aiStatus,
+            "statusReason": "" if aiAvailable else aiOffReason,
         },
         "ui": ui,
         "version": applicationVersion,
