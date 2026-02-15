@@ -207,6 +207,43 @@ def domainIsListed(domain: str, listed: List[str]) -> bool:
             return True
     return False
 
+def sanitizeAiErrorReason(reason: Any) -> str:
+    s = str(reason or "").strip()
+    if not s:
+        return ""
+
+    if "RESOURCE_EXHAUSTED" in s or "Quota exceeded" in s or "rate-limits" in s or "generate_content" in s:
+        return "Quota exceeded; retry later."
+
+    if "429" in s:
+        return "Quota exceeded; retry later."
+
+    if "401" in s or "PERMISSION_DENIED" in s or "UNAUTHENTICATED" in s:
+        return "Authentication failed; check API key or permissions."
+
+    if "503" in s or "UNAVAILABLE" in s:
+        return "Service temporarily unavailable; retry later."
+
+    if "400" in s or "INVALID_ARGUMENT" in s:
+        return "Invalid request; check input and configuration."
+
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                err = obj.get("error")
+                if isinstance(err, dict):
+                    msg = str(err.get("message") or "").strip()
+                    if msg:
+                        return msg.split("\n")[0].strip()
+        except Exception:
+            pass
+
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > 120:
+        s = s[:117] + "..."
+    return s
+
 # =====================================================================
 # Optional enrichment: Google Safe Browsing (URL reputation)
 # =====================================================================
@@ -845,40 +882,49 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
         aiAvailable, aiPayload = analyzeWithGemini(request, features, settings, urlRep)
 
     aiStatus = "on" if aiAvailable else "off"
+
     if aiDisabledByUser:
-        aiOffReason = "Disabled in Settings"
+        aiOffReasonRaw = "Disabled in Settings"
     else:
-        aiOffReason = str((aiPayload.get("_meta", {}) or {}).get("error", "")).strip() if isinstance(aiPayload, dict) else ""
-        if not aiOffReason:
-            aiOffReason = "AI unavailable"
+        aiOffReasonRaw = str((aiPayload.get("_meta", {}) or {}).get("error", "")).strip() if isinstance(aiPayload,
+                                                                                                        dict) else ""
+        if not aiOffReasonRaw:
+            aiOffReasonRaw = "AI unavailable"
+
+    aiOffReason = sanitizeAiErrorReason(aiOffReasonRaw) or "AI unavailable"
 
     if aiAvailable:
         hardChecks = aiPayload.get("hardChecks", [])
         if not isinstance(hardChecks, list):
             hardChecks = []
-    else:
-        hardChecks = fallbackHardChecks(request, features, settings, urlRep)
-        aiReason = "AI disabled by user." if aiDisabledByUser else f"AI unavailable; used deterministic fallback checks only. ({aiOffReason})"
-        aiPayload = {
-            "hardChecks": hardChecks,
-            "freeAssessment": {
-                "risk": 0,
-                "threatType": "other",
-                "summary": "",
-                "keyFindings": [],
-                "recommendedAction": "",
-            },
-            "confidence": {
-                "label": "Low",
-                "score": 0,
-                "rationale": [aiReason],
-            },
-            "_meta": {
-                "model": "",
-                "latencyMs": 0,
-                "error": "AI disabled" if aiDisabledByUser else aiOffReason,
-            },
-        }
+        else:
+            hardChecks = fallbackHardChecks(request, features, settings, urlRep)
+
+            if aiDisabledByUser:
+                aiReason = "AI disabled by user."
+            else:
+                aiReason = "AI unavailable; used deterministic fallback checks only."
+
+            aiPayload = {
+                "hardChecks": hardChecks,
+                "freeAssessment": {
+                    "risk": 0,
+                    "threatType": "other",
+                    "summary": "",
+                    "keyFindings": [],
+                    "recommendedAction": "",
+                },
+                "confidence": {
+                    "label": "Low",
+                    "score": 0,
+                    "rationale": [aiReason],
+                },
+                "_meta": {
+                    "model": "",
+                    "latencyMs": 0,
+                    "error": aiOffReason,
+                },
+            }
 
     hardRisk, hardReasons = computeHardRisk(hardChecks)
 
@@ -957,7 +1003,8 @@ def analyze(request: AnalyzeRequest) -> Dict[str, Any]:
             "recommendedAction": str(freeAssessment.get("recommendedAction", "")).strip(),
             "model": aiPayload.get("_meta", {}).get("model", ""),
             "latencyMs": aiPayload.get("_meta", {}).get("latencyMs", 0),
-            "error": aiPayload.get("_meta", {}).get("error", ""),
+
+            "error": "" if aiAvailable else aiOffReason,
             "hardChecks": hardChecks,
             "confidence": {"label": confidenceLabel, "score": confidenceScore, "rationale": rationale},
             "status": aiStatus,
