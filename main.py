@@ -1,3 +1,48 @@
+"""
+===============================================================================
+ScamurAI — Email Threat Analysis Backend
+===============================================================================
+
+Description:
+ScamurAI backend provides AI-assisted and deterministic email risk analysis.
+It exposes an HTTP API consumed by the Gmail add-on frontend.
+
+Core responsibilities:
+    • Parsing structured email payloads
+    • Deterministic hard security checks
+    • AI-driven free-form reasoning and classification
+    • Risk aggregation and weighted scoring
+    • Confidence estimation and rationale generation
+    • Google Safe Browsing URL reputation checks
+    • Structured UI metadata packaging for frontend rendering
+
+Architecture principles:
+    • Separation between hard (deterministic) checks and AI assessment
+    • Configurable sensitivity and weighting
+    • Graceful degradation when AI is unavailable
+    • Explicit metadata for UI stability (aiStatus, safeBrowsing, traceId)
+    • Stateless API — frontend manages per-message snapshot persistence
+
+Security:
+    • No persistent storage of email content
+    • All analysis performed in-memory per request
+    • API designed for user-scoped frontend invocation
+
+Author:
+    Naor Daniel
+
+Project:
+    ScamurAI — AI-Driven Email Threat Analysis System
+
+Year:
+    2026
+
+This backend is part of a research-oriented and production-grade security tool
+designed to provide transparent, explainable email threat assessment.
+===============================================================================
+"""
+
+
 from __future__ import annotations
 
 import json
